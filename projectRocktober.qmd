@@ -1,0 +1,151 @@
+---
+title: "The Coors Problem"
+format: html
+editor: visual
+---
+
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
+library(rvest)
+library(dplyr) 
+library(tidyverse)
+library(knitr)
+library(ggplot2)
+library(gridExtra)
+```
+
+## The Coors Effect
+
+Every home stadium has unique features that make the game a little different depending on where the game is being played, but despite these differences 29 teams are playing a similar enougn game. The Rockies on the other hand are playing a different game for half their season, Coor field has been commped to playing "on the moon".
+
+```{r, echo=FALSE, warning=FALSE}
+
+coors_shapes = read_csv('mean_coors_pitches.csv') |> mutate(park = 1)
+pitch_shapes = read_csv('mean_regular_pitches.csv') |> mutate(park = 0)
+
+pitch_types = unique(pitch_shapes$pitch_type)
+pitch_shapes = rbind(pitch_shapes, coors_shapes)
+
+
+pitch_shapes$stuff_bin = as.factor(pitch_shapes$stuff_bin)
+pitch_shapes$release_height_bin = as.factor(pitch_shapes$release_height_bin)
+pitch_shapes$pitch_type = as.factor(pitch_shapes$pitch_type)
+pitch_shapes$park = as.factor(pitch_shapes$park)
+view(pitch_shapes)
+
+for (pitch in pitch_types){
+  plot = ggplot(pitch_shapes |> filter(pitch_type == as.character(pitch)),
+                aes(x=mean_hb,y=mean_ivb, size = stuff_bin, shape = park, color = release_height_bin))+geom_point() + labs(title = as.character(pitch))
+  print(plot)
+}
+```
+
+The velocity difference doesn't look super significant, every pitch crosses zero, and the mean difference is usually around zero for each pitch type. There's some difference with fastball velocity and slider velocity, but we still want to look to see if there is a signifigant difference.
+
+```{r}
+coors_stuff = read_csv('coors_stuffP.csv')
+stuff_plus = read_csv("regular_stuffP.csv")
+
+temp5 = coors_stuff |> group_by(pitch_type) |> summarise(weighted.mean(avg_stuff_plus, pitch_count)) 
+temp6  = stuff_plus |> group_by(pitch_type) |> summarise(weighted.mean(avg_stuff_plus, pitch_count)) 
+
+stuff_comp = left_join(temp5, temp6, by = 'pitch_type')
+names(stuff_comp) = c('pitch_type', 'coors', 'regular')
+view(stuff_comp)
+
+
+```
+
+<https://www.mlb.com/rockies/news/how-rockies-can-win-consistently-at-altitude>
+
+<https://youtu.be/bN7OWOi5aJE?si=iEObYNSYbPt_Op_A>
+
+Bullet Sliders, rest, walk rates, velocity
+
+Since this is just 2024 and the average for each pitcher, there isn't enough to test for every pitch. So T testing for just change up fastball and slider there is no significant differenc in velocity for each pitch.
+
+```{r, echo=FALSE, warning=FALSE}
+
+coors_data = read_csv("~/Desktop/Baseball_Predictions/Rockies/all_coors_pitches.csv")
+view(head(coors_data))
+
+
+names(coors_data)
+
+coors_data |> group_by(pitch_type, summarise())
+```
+
+The big takeaway from the chart is that you can the break is limited, everything is pulled towards zero. The initial thought is that there is a difference in the spin rates for the pitch, because reduced spin means reduced movement.
+
+```{r, echo=FALSE, warning=FALSE}
+
+
+for(pitch in pitch_types){ 
+  damage_heatmap_data = coors_data %>% filter(pitch_type == as.character(pitch)) %>%
+    filter(!is.na(delta_run_exp)) %>%
+    mutate(
+      plate_x = round(plate_x, 1),
+      plate_z = round(plate_z, 1)
+    ) %>%
+    group_by(plate_x, plate_z) %>%
+    summarise(mean_rv = mean(delta_run_exp, na.rm = TRUE), .groups = "drop")
+  
+  # Heatmap plot
+  plot = ggplot(damage_heatmap_data, aes(x = plate_x, y = plate_z, fill = mean_rv)) +
+    geom_tile(color = "white") +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red", midpoint = 0,
+      name = "Run Value"
+    ) +
+    coord_fixed() +
+    theme_minimal() +
+    labs(title = pitch,
+         x = "Horizontal Plate Location (inches)",
+         y = "Vertical Plate Location (inches)") +
+    theme(plot.title = element_text(hjust = 0.5))
+  print(plot)}
+```
+
+The dashed blue line represents the y=x line meaning that if the spin is roughly the same in Coors field vs an away game. The pitches fall roughly along the line, meaning that reduced spin rate is not the root cause of the reduced movement. The issue is actually the air density. Spin causes break because it manipulating the movement of the ball in the air, in Coors field the air is denser causing not a reduced spin, but reducing the effect of the spin. As you see in the chart there is about a 4-5 loss of movement.
+
+```{r, echo=FALSE, warning=FALSE}
+
+
+for (pitch in pitch_types) { 
+  damage_zone_data <- coors_data %>%
+    filter(pitch_type == as.character(pitch)) %>%
+    filter(!is.na(delta_run_exp), !is.na(zone)) %>%
+    group_by(zone) %>%
+    summarise(mean_rv = mean(delta_run_exp, na.rm = TRUE), .groups = "drop") %>%
+    mutate(zone = as.character(zone))  # Convert to character for join
+  
+  # Create a strike zone grid (typical zones 1–9 only)
+  zone_grid <- expand.grid(
+    x = rep(1:3, each = 3),
+    y = rep(3:1, 3)
+  )
+  zone_grid$zone <- as.character(1:9)  # Ensure zone is character
+
+  # Merge zone positions with run value
+  plot_data <- left_join(zone_grid, damage_zone_data, by = "zone")
+
+  # Plot
+  plot <- ggplot(plot_data, aes(x = x, y = y, fill = mean_rv)) +
+    geom_tile(color = "black") +
+    scale_fill_gradient2(
+      low = "blue", mid = "white", high = "red", midpoint = 0,
+      name = "Δ Run Exp"
+    ) +
+    coord_fixed() +
+    theme_minimal() +
+    labs(title = paste("Zone Heatmap:", pitch),
+         x = NULL,
+         y = NULL) +
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text = element_blank(),
+          axis.ticks = element_blank())
+
+  print(plot)
+}
+
+
+```
