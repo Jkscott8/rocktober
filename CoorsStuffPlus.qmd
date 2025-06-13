@@ -1,0 +1,501 @@
+---
+title: "stuffPlus"
+format: html
+editor: visual
+---
+
+Load Packages and Data
+
+```{r}
+library(tidyverse)
+library(xgboost)
+library(ggplot2)
+library(baseballr)
+library(arrow)
+
+training_data = read_csv_arrow("~/training_data2.csv")
+test_set = read_csv_arrow("~/pitching_data2024.csv")
+
+view(head(test_set))
+```
+
+Step 0: Get New Data Off Savant
+
+```{r}
+pitcher_2025 = data.frame()
+for (i in 2025:2025){
+  for (j in 4:4){
+    for (k in 14:14){
+      data = scrape_statcast_savant_pitcher(start_date = paste0(i,'-',j,'-',k),end_date = paste0(i,'-',j,'-',k))
+      pitcher_2025 = rbind(pitcher_2025, data) 
+      Sys.sleep(2)}
+    }
+  }
+```
+
+Step 1: Set up Features
+
+```{r}
+data_prep <- function(df) {
+  df$description <- as.factor(df$description)
+  df$spin_direction <- df$spin_axis / 7.5
+  df$release_pos_x <- abs(df$release_pos_x)
+  df$hand_matchup <- ifelse(df$p_throws == df$stand, 1, 0)
+
+  df <- df %>%
+    group_by(player_name, game_year) %>%
+    mutate(
+      avg_velo = if (sum(pitch_type %in% c('FF', 'SI', 'FC'), na.rm = TRUE) > 0) {
+        mean(release_speed[pitch_type %in% c('FF', 'SI', 'FC')], na.rm = TRUE)
+      } else {
+        max(release_speed, na.rm = TRUE)
+      },
+      mean_ivb = if (sum(pitch_type %in% c('FF', 'SI', 'FC'), na.rm = TRUE) > 0) {
+        mean(pfx_z[pitch_type %in% c('FF', 'SI', 'FC')], na.rm = TRUE)
+      } else {
+        max(pfx_z, na.rm = TRUE)
+      }
+    ) %>%
+    ungroup() %>%
+    mutate(
+      velo_diff = release_speed - avg_velo,
+      ivb_diff = pfx_z - mean_ivb,
+      count = as.factor(paste0(balls, strikes)),
+      ivb = pfx_z * 12,
+      hb = ifelse(df$p_throws == 'R', pfx_x, -pfx_x)  * 12
+      #hb = pfx_x * 12
+    )
+
+  return(df)
+}
+```
+
+Step 2: Define Pitch Outcomes and Set Target Credit to TJ stats for the methodology for the target
+
+```{r}
+map_outcomes = function(df) {  
+  df <- df %>%
+  mutate(outcome_simple = case_when(
+    description %in% c("ball", "blocked_ball", "hit_by_pitch", "pitchout") ~ "ball",
+    description %in% c("foul", "foul_bunt", "foul_tip") ~ "foul",
+    description %in% c("called_strike", "missed_bunt", "swinging_strike",
+                       "swinging_strike_blocked", "called_strike_blocked") ~ "strike",
+    description == "hit_into_play" ~ events,
+    TRUE ~ NA_character_
+  ))
+
+  
+mean_rv_df <- df %>%
+  filter(!is.na(outcome_simple)) %>%
+  group_by(count, outcome_simple) %>%
+  summarise(mean_RV = mean(delta_run_exp, na.rm = TRUE), .groups = "drop")
+
+  
+  df <- df %>%
+  left_join(mean_rv_df, by = c("count", "outcome_simple"))
+
+  return(df)
+}
+```
+
+Step 3: Filter Pitch Types and Scale Features
+
+```{r}
+filter_pitches <- function(df) {
+  df <- df[!is.na(df$mean_RV), ]
+  pitch_types <- c('FF','SI','FC','CH','FS','CU','KC','SL','ST','SV')
+  df <- df[df$pitch_type %in% pitch_types, ]
+  
+  #df_scaled <- df %>%
+  #  mutate(across(
+  #    c(release_speed, ivb, hb, velo_diff, release_extension, release_pos_z, 
+  #      release_pos_x, release_spin_rate, spin_axis, ivb_diff, plate_x, plate_z),
+  #    ~ scale(.)[, 1]
+  #  ))
+  #return(df_scaled)
+  return(df)
+}
+```
+
+Step 4: Set up data frame
+
+```{r}
+training_data = training_data |> data_prep() |> map_outcomes() |> filter_pitches() |> select(release_speed, ivb, hb, velo_diff, ivb_diff, release_extension, release_pos_z, release_pos_x ,release_spin_rate, spin_axis, hand_matchup , mean_RV)
+```
+
+Step 5: Train Model and Save it
+
+```{r}
+
+train_df = training_data|> select(-(mean_RV)) |> as.matrix()
+train_y = training_data$mean_RV
+
+params <- list(
+  objective = "reg:squarederror",  # regression with squared loss
+  max_depth = 6,                   # tree depth
+  eta = 0.05,                       # learning rate (same as learning_rate)
+  subsample = 0.75,                # row sampling
+  colsample_bytree = 0.75,         # column sampling per tree
+  lambda = 0.3,                    # L2 regularization (reg_lambda)
+  alpha = 0.4,                     # L1 regularization (reg_alpha)
+  seed = 77                        # reproducibility
+)
+
+
+stuff_model = xgboost(data = train_df, label = train_y, nrounds = 250, early_stopping_rounds = 20,print_every_n = 10,  eval_metric = "rmse", booster = "gbtree", params)
+
+
+
+features = c('release_speed', 'ivb', 'hb', 'velo_diff', 'ivb_diff', 'release_extension', 'release_pos_z', 'release_pos_x' ,'release_spin_rate', 'spin_axis', 'hand_matchup')
+imp <- xgb.importance(model = stuff_model, feature_names = features)
+imp
+
+xgb.save(stuff_model, 'general_stuff_modelv6.model')
+stuff_model = xgb.load('general_stuff_modelv6.model')
+```
+
+Step 6: Test on New Data
+
+```{r}
+test_set = test_set |> data_prep() |> map_outcomes() |> filter_pitches() |> select(release_speed, ivb, hb, velo_diff, ivb_diff, release_extension, release_pos_z, release_pos_x ,release_spin_rate, spin_axis, hand_matchup , mean_RV)
+                                                                                  
+test_df  = test_set |> select(-(mean_RV)) |> as.matrix()
+test_y = test_set$mean_RV
+
+preds = predict(stuff_model, test_df)
+rmse = sqrt(mean((preds - test_y)^2))
+rmse
+```
+
+Step 7a: Get RV range for grading
+
+```{r}
+stuff_model = xgb.load("general_stuff_modelv6.model")
+training_data = read_csv_arrow("~/training_data2.csv")
+data_2021 = training_data[training_data$game_date < "2021-09-30" & training_data$game_date> "2021-03-30", ]
+data_2022 = training_data[training_data$game_date < "2022-09-30" & training_data$game_date> "2022-03-30", ]
+data_2023 = training_data[training_data$game_date < "2023-09-30" & training_data$game_date> "2023-03-30", ]
+data_2024 = test_set
+
+years = list(data_2021, data_2022, data_2023, data_2024)
+rv_data = data.frame()
+for(df in years){
+  i = 2021
+  year = as.character(unique(df$game_year))
+  df = df |> data_prep() |> map_outcomes() |> filter_pitches() |> select(release_speed, ivb, hb, velo_diff, ivb_diff, release_extension, release_pos_z, release_pos_x ,release_spin_rate, spin_axis, hand_matchup , mean_RV)
+  grading_data = df |> select(-mean_RV) |> as.matrix()
+  predictions = -predict(stuff_model, grading_data)
+  temp = data.frame(year = year, mean = mean(predictions), sd = sd(predictions))
+  rv_data = rbind(rv_data, temp)
+}
+```
+
+Step 7b: Grade Stuff
+
+```{r}
+
+stuff_grading = function(df, model_path="general_stuff_modelv6.model", year = 2024){
+  rv_mean = rv_data$mean[rv_data$year == year]
+  rv_sd = rv_data$sd[rv_data$year == year]
+  df = df |> data_prep() |> map_outcomes() |> filter_pitches() 
+  df = df |> select(
+                    player_name, pitch_type, release_speed, ivb, hb, velo_diff, 
+                    ivb_diff ,release_extension, release_pos_z, release_pos_x 
+                    ,release_spin_rate, spin_axis,hand_matchup,mean_RV)
+  grading_data = df |> select(-c(player_name, pitch_type, mean_RV, hand_matchup)) |> as.matrix()
+  load_model = xgb.load(model_path)
+  print(names(df))
+  predictions = predict(load_model, grading_data)
+  stuff_score = -predictions
+  stuff_plus = 100 + 20 * ((stuff_score - rv_mean)/rv_sd)
+  df = df |> mutate(stuff_plus = stuff_plus, pred_rv = -stuff_score)
+  return(df)
+  }
+```
+
+Step 8: Grade pitchers
+
+```{r}
+stuff_df = function(df, min_pitches = 50){
+  per_pitch = df |> group_by(player_name, pitch_type) |> summarise(avg_stuff_plus =
+  mean(stuff_plus), pitch_count = n(), .groups = 'drop') |> filter(pitch_count >= min_pitches)
+  
+  per_pitcher = per_pitch |> group_by(player_name) |> summarise(
+    total_stuff_plus = weighted.mean(avg_stuff_plus, pitch_count),
+    total_pitches=sum(pitch_count), .groups = 'drop')
+  
+  overall_stuff = left_join(per_pitch, per_pitcher, by = 'player_name') |> 
+    arrange(desc(total_stuff_plus))
+  return(overall_stuff)
+}
+```
+
+Step 9: Grade New Data
+
+```{r}
+training_data = read_csv_arrow("~/training_data2.csv")
+data_2021 = training_data[training_data$game_date < "2021-09-30" & training_data$game_date> "2021-03-30", ]
+data_2022 = training_data[training_data$game_date < "2022-09-30" & training_data$game_date> "2022-03-30", ]
+data_2023 = training_data[training_data$game_date < "2023-09-30" & training_data$game_date> "2023-03-30", ]
+
+data_2021 = data_2021 |> stuff_grading(year = 2021) |> stuff_df()
+data_2022 = data_2022 |> stuff_grading(year = 2022) |> stuff_df()
+data_2023 = data_2023 |> stuff_grading(year = 2023) |> stuff_df()
+#data_2024 = test_set |> stuff_grading(year = 2024) |> stuff_df()
+
+```
+Step 10: Analyze Results
+
+```{r}
+sheet_names <- readxl::excel_sheets("~/Downloads/STUFF PLUS V2.xlsx")
+era24 <- readxl::read_excel("~/Downloads/STUFF PLUS V2.xlsx", sheet = sheet_names[9]) |> filter((IP > 40)) |> 
+  mutate(player_name = str_replace(Player, "^(\\S+)\\s+(.*)$", "\\2, \\1")) |> distinct(player_name, .keep_all = TRUE) |> select(player_name, `FIP`, `2024 ERA`)
+era23 <- readxl::read_excel("~/Downloads/STUFF PLUS V2.xlsx", sheet = sheet_names[10]) |> filter((IP > 40)) |> 
+  mutate(player_name = str_replace(Player, "^(\\S+)\\s+(.*)$", "\\2, \\1")) |> distinct(player_name, .keep_all = TRUE) |> select(player_name, FIP, ERA)
+era22 <- readxl::read_excel("~/Downloads/STUFF PLUS V2.xlsx", sheet = sheet_names[11]) |> filter((IP > 40)) |> 
+  mutate(player_name = str_replace(Player, "^(\\S+)\\s+(.*)$", "\\2, \\1")) |> distinct(player_name, .keep_all = TRUE) |> select(player_name, FIP, ERA)
+names(era24) = names(era23)
+
+
+#data_2024 = data_2024 |> select(player_name, total_stuff_plus) |> group_by(player_name) |> summarise(stuff_plus = mean(total_stuff_plus)) |> #mutate(year = 2024)
+
+data_2023 = data_2023 |> select(player_name, total_stuff_plus) |> group_by(player_name) |> summarise(stuff_plus = mean(total_stuff_plus)) |> mutate(year = 2023)
+data_2023 = left_join(era24, data_2023, by='player_name')
+
+data_2022 = data_2022 |> select(player_name, total_stuff_plus) |> group_by(player_name) |> summarise(stuff_plus = mean(total_stuff_plus)) |> mutate(year = 2022)
+data_2022 = left_join(era23, data_2022, by='player_name')
+
+data_2021 = data_2021 |> select(player_name, total_stuff_plus) |> group_by(player_name) |> summarise(stuff_plus = mean(total_stuff_plus)) |> mutate(year = 2021)
+data_2021 = left_join(era22, data_2021, by='player_name')
+
+temp1 = rbind(data_2021, data_2022)
+stuffStats = rbind(temp1, data_2023)
+stuffStats = stuffStats[!is.na(stuffStats$year),]
+
+cor(stuffStats$stuff_plus, stuffStats$ERA) # -.31 correlation with next year ERA
+cor(stuffStats$stuff_plus, stuffStats$FIP) # -.35 correlation with next year FIP
+ggplot(stuffStats, aes(y = stuff_plus, x = ERA))+
+  geom_point()
+
+```
+
+Step 11: Apply to Coors Data
+
+```{r}
+coors_data = data.frame()
+for (i in 1:4){
+  temp = read_csv_arrow(paste0("~/Downloads/coors202",i,'.csv'))
+  coors_data = rbind(coors_data, temp)
+}
+
+coors = coors_data |> data_prep() |> map_outcomes() |> filter_pitches() |> scale_pitches() |> select(release_speed, ivb, hb, velo_diff, ivb_diff,release_extension, release_pos_z, release_pos_x ,release_spin_rate, spin_axis , mean_RV)
+```
+
+Step 12: Train Coors Stuff+
+
+```{r}
+
+train_idx = sample(nrow(coors), 0.85 * nrow(coors))
+train_df = coors[train_idx,]|> select(-(mean_RV)) |> as.matrix()
+train_y = coors$mean_RV[train_idx]
+test_df  = coors[-train_idx,] |> select(-(mean_RV)) |> as.matrix()
+test_y = coors$mean_RV[-train_idx]
+
+params <- list(
+  objective = "reg:squarederror",  # regression with squared loss
+  max_depth = 6,                   # tree depth
+  eta = 0.05,                       # learning rate (same as learning_rate)
+  subsample = 0.75,                # row sampling
+  colsample_bytree = 0.75,         # column sampling per tree
+  lambda = 0.3,                    # L2 regularization (reg_lambda)
+  alpha = 0.4,                     # L1 regularization (reg_alpha)
+  seed = 77                        # reproducibility
+)
+
+
+coors_model = xgboost(data = train_df, label = train_y, nrounds = 500, early_stopping_rounds = 20,print_every_n = 10,  eval_metric = "rmse", booster = "gbtree", params)
+
+coors_model = xgb.load('coorsModel.model')
+coors_predictions = predict(coors_model, (coors |> select(-(mean_RV)) |> as.matrix()))
+temp = data.frame(year = 'coors', mean = mean(coors_predictions), sd = sd(coors_predictions))
+rv_data = rbind(rv_data, temp)
+
+
+y_pred = predict(coors_model, test_df)
+rmse = sqrt(mean((y_pred - test_y)^2))
+rmse
+
+
+imp <- xgb.importance(model = coors_model)
+imp
+
+plot(y_pred, test_y, pch = 16, col = "steelblue",
+     xlab = "Predicted Run Value", ylab = "Actual Run Value",
+     main = "Predicted vs Actual Run Value")
+abline(0, 1, col = "red", lwd = 2)
+
+
+xgb.save(coors_model, 'coorsModel.model')
+```
+
+Step 13: Train Coors Data on Regular Model to compare what grades it gives
+
+```{r}
+reg_model = coors_data |> stuff_grading() |> stuff_df()
+coors_model = coors_data |> stuff_grading(model_path = 'coorsModel.model') |> stuff_df()
+names(coors_model) = c("player_name","pitch_type","avg_stuff_plus_coors","pitch_count","total_stuff_plus_coors","total_pitches")
+
+reg_model = reg_model |> select(player_name, pitch_type, avg_stuff_plus, total_stuff_plus)
+coors_model = coors_model |> select(player_name, pitch_type, avg_stuff_plus_coors, total_stuff_plus_coors)
+
+comparison = left_join(coors_model, reg_model, by = c('player_name', 'pitch_type')) 
+comparison$difference_pitch = comparison$avg_stuff_plus_coors - comparison$avg_stuff_plus
+comparison$difference_ovr = comparison$total_stuff_plus_coors - comparison$total_stuff_plus
+view(comparison)
+view(coors_model)
+
+comparison |> group_by(pitch_type) |> summarise(coors_mean = mean(avg_stuff_plus_coors), reg_mean = mean(avg_stuff_plus))
+
+
+```
+
+Step 14: Grade Coors Stuff and Analyze Effectiveness
+
+```{r}
+
+
+coors_stuff = coors_data |> stuff_grading(model_path ='coorsModel.model',  year = 'coors') 
+
+coors_stuff = coors_data |> stuff_grading(model_path ='coorsModel.model',  year = 'coors') 
+coors_reg = coors_data |> stuff_grading(model_path = "general_stuff_modelv6.model" ,year = 'coors')
+other_coors = test_set |> stuff_grading(model_path ='coorsModel.model',  year = 'coors') 
+other_reg = test_set |> stuff_grading(model_path = "general_stuff_modelv6.model" ,year = '2024')
+
+
+
+coors_reg  |> summarise(mean(stuff_plus))
+other_reg  |> summarise(mean(stuff_plus))
+coors_stuff  |> summarise(mean(stuff_plus))
+other_coors  |> summarise(mean(stuff_plus))
+
+
+
+ggplot(coors_stuff[coors_stuff$stuff_plus > 50,], aes(x=pitch_type, y=stuff_plus))+
+  geom_boxplot()
+
+ggplot(coors_reg[coors_reg$stuff_plus > 50,], aes(x=pitch_type, y=stuff_plus))+
+  geom_boxplot()
+
+temp = cbind(coors_data |> data_prep() |> map_outcomes() |> filter_pitches() , coors_stuff |> select(stuff_plus, pred_rv))
+temp2 = cbind(test_set |> data_prep() |> map_outcomes() |> filter_pitches(), other_reg |> select(stuff_plus, pred_rv))
+
+
+
+temp %>%
+  mutate(stuff_bin = ntile(stuff_plus, 10)) %>%
+  group_by(stuff_bin) %>%
+  summarise(mean_pred_rv = mean(pred_rv), actual_rv = mean(mean_RV),
+            avg_whiff = mean(description == "swinging_strike", na.rm = TRUE))
+
+
+
+```
+
+Step 15: Add Buckets for Each for easy comp
+
+```{r}
+
+arm_slot = c(0, seq(4.5, 6.9, by = 0.2), 7.5)
+coors_data$relHeight_bucket <- cut(as.numeric(coors_data$release_pos_z), breaks = arm_slot, include.lowest = TRUE)
+temp = cbind(temp, coors_data |> data_prep() |> map_outcomes() |> filter_pitches() |> select(relHeight_bucket))
+
+
+temp = temp[,-133]
+
+temp |> group_by(relHeight_bucket) |> summarise(mean(stuff_plus))
+
+ggplot(temp, aes(x=relHeight_bucket, y=stuff_plus))+
+  geom_boxplot()
+
+
+```
+
+Step 16: Analyze What Makes A Pitch Good in Coors
+
+```{r}
+
+temp = temp[!is.na(temp$release_spin_rate),]
+temp = temp[!is.na(temp$spin_axis),]
+
+temp2 = temp2[!is.na(temp2$release_spin_rate),]
+temp2 = temp2[!is.na(temp2$spin_axis),]
+
+coors_pitches <- temp %>%
+  mutate(
+    stuff_bin = ntile(stuff_plus, 5),
+    release_height_bin = ntile(release_pos_z, 4)
+  ) %>%
+  group_by(pitch_type, stuff_bin, release_height_bin) %>%
+  summarise(
+    mean_velo = round(mean(release_speed, na.rm = TRUE), 3),
+    mean_ivb = round(mean(ivb, na.rm = TRUE), 3),
+    mean_hb = round(mean(hb, na.rm = TRUE), 3),
+    mean_spin = round(mean(release_spin_rate, na.rm = TRUE), 3),
+    mean_ivb_diff = round(mean(ivb_diff, na.rm = TRUE), 3),
+    mean_velo_diff = round(mean(velo_diff, na.rm = TRUE), 3),
+    mean_release_x = round(mean(release_pos_x),3),
+    mean_axis = round(mean(spin_axis),3),
+    avg_stuff_plus = round(mean(stuff_plus, na.rm = TRUE), 1),
+    count = n(),
+    .groups = "drop"
+  )
+
+regular_pitches <- temp2 %>%
+  mutate(
+    stuff_bin = ntile(stuff_plus, 5),
+    release_height_bin = ntile(release_pos_z, 4)
+  ) %>%
+  group_by(pitch_type, stuff_bin, release_height_bin) %>%
+  summarise(
+    mean_velo = round(mean(release_speed, na.rm = TRUE), 3),
+    mean_ivb = round(mean(ivb, na.rm = TRUE), 3),
+    mean_hb = round(mean(hb, na.rm = TRUE), 3),
+    mean_spin = round(mean(release_spin_rate, na.rm = TRUE), 3),
+    mean_ivb_diff = round(mean(ivb_diff, na.rm = TRUE), 3),
+    mean_velo_diff = round(mean(velo_diff, na.rm = TRUE), 3),
+    mean_release_x = round(mean(release_pos_x),3),
+    mean_axis = round(mean(spin_axis),3),
+    avg_stuff_plus = round(mean(stuff_plus, na.rm = TRUE), 1),
+    count = n(),
+    .groups = "drop"
+  )
+
+view(coors_pitches[coors_pitches$pitch_type =='SI',])
+view(regular_pitches)
+
+
+temp3 = coors_data |> stuff_grading() |> stuff_df()
+temp4 = test_set |> stuff_grading() |> stuff_df()
+
+write_csv(coors_pitches, 'mean_coors_pitches.csv')
+write_csv(regular_pitches, 'mean_regular_pitches.csv')
+write_csv(temp3, 'coors_stuffP.csv')
+write_csv(temp4, 'regular_stuffP.csv')
+
+
+write_csv(temp, 'all_coors_pitches.csv')
+```
+
+Plots
+```{r}
+coors_pitches$stuff_bin = as.factor(coors_pitches$stuff_bin)
+ggplot(coors_pitches[coors_pitches$release_height_bin == 1,], aes(shape = stuff_bin, color = pitch_type, x=mean_hb, y=mean_ivb))+
+  geom_point()
+
+```
+
+
+
+
+
+
