@@ -1,8 +1,8 @@
 Project deticated to figuring out how to "fix" the Rockies :
 
-Work in progress
+**Work in progress**
 
-
+Started by creating a stuff+ model for pitches in coors only to analyze who/what preforms best in coors.
 
 
 
