@@ -7,4 +7,5 @@ Started by creating a stuff+ model for pitches in coors only to analyze who/what
 
 
 Credit to TJ Stats for providing a blueprint for developing a stuff model, https://medium.com/@thomasjamesnestico/modelling-tjstuff-v3-0-10b48294c7fb 
-All data found using baseball savant
+
+All data found using baseball savant and baseball R 
