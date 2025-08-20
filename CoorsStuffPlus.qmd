@@ -13,6 +13,7 @@ library(ggplot2)
 library(baseballr)
 library(arrow)
 
+# Load in data
 training_data = read_csv_arrow("~/training_data2.csv")
 test_set = read_csv_arrow("~/pitching_data2024.csv")
 
@@ -22,6 +23,7 @@ view(head(test_set))
 Step 0: Get New Data Off Savant
 
 ```{r}
+# Loop through baseball savant search for each day needed
 pitcher_2025 = data.frame()
 for (i in 2025:2025){
   for (j in 4:4){
@@ -36,6 +38,7 @@ for (i in 2025:2025){
 Step 1: Set up Features
 
 ```{r}
+# Convert data to the prefered units
 data_prep <- function(df) {
   df$description <- as.factor(df$description)
   df$spin_direction <- df$spin_axis / 7.5
@@ -45,11 +48,13 @@ data_prep <- function(df) {
   df <- df %>%
     group_by(player_name, game_year) %>%
     mutate(
+      # Find the average and max velocity of the pitchers fastballs
       avg_velo = if (sum(pitch_type %in% c('FF', 'SI', 'FC'), na.rm = TRUE) > 0) {
         mean(release_speed[pitch_type %in% c('FF', 'SI', 'FC')], na.rm = TRUE)
       } else {
         max(release_speed, na.rm = TRUE)
       },
+      # Find the average and max ivb of the pitchers fastballs
       mean_ivb = if (sum(pitch_type %in% c('FF', 'SI', 'FC'), na.rm = TRUE) > 0) {
         mean(pfx_z[pitch_type %in% c('FF', 'SI', 'FC')], na.rm = TRUE)
       } else {
@@ -58,6 +63,7 @@ data_prep <- function(df) {
     ) %>%
     ungroup() %>%
     mutate(
+    # Create pitch metrics 
       velo_diff = release_speed - avg_velo,
       ivb_diff = pfx_z - mean_ivb,
       count = as.factor(paste0(balls, strikes)),
@@ -73,6 +79,7 @@ data_prep <- function(df) {
 Step 2: Define Pitch Outcomes and Set Target Credit to TJ stats for the methodology for the target
 
 ```{r}
+# Take baseball savants pitch outcomes and convert to simple identifiers
 map_outcomes = function(df) {  
   df <- df %>%
   mutate(outcome_simple = case_when(
@@ -84,7 +91,7 @@ map_outcomes = function(df) {
     TRUE ~ NA_character_
   ))
 
-  
+# Find the mean run value based off the count and pitch outcome  
 mean_rv_df <- df %>%
   filter(!is.na(outcome_simple)) %>%
   group_by(count, outcome_simple) %>%
@@ -101,11 +108,13 @@ mean_rv_df <- df %>%
 Step 3: Filter Pitch Types and Scale Features
 
 ```{r}
+# Filter out pitch types used by position players 
 filter_pitches <- function(df) {
   df <- df[!is.na(df$mean_RV), ]
   pitch_types <- c('FF','SI','FC','CH','FS','CU','KC','SL','ST','SV')
   df <- df[df$pitch_type %in% pitch_types, ]
-  
+
+  # Scale the data 
   #df_scaled <- df %>%
   #  mutate(across(
   #    c(release_speed, ivb, hb, velo_diff, release_extension, release_pos_z, 
@@ -120,16 +129,18 @@ filter_pitches <- function(df) {
 Step 4: Set up data frame
 
 ```{r}
+# Select only needed columns from the data
 training_data = training_data |> data_prep() |> map_outcomes() |> filter_pitches() |> select(release_speed, ivb, hb, velo_diff, ivb_diff, release_extension, release_pos_z, release_pos_x ,release_spin_rate, spin_axis, hand_matchup , mean_RV)
 ```
 
 Step 5: Train Model and Save it
 
 ```{r}
-
+# Split into a testing and training dataset
 train_df = training_data|> select(-(mean_RV)) |> as.matrix()
 train_y = training_data$mean_RV
 
+# Used suggested paramters for model 
 params <- list(
   objective = "reg:squarederror",  # regression with squared loss
   max_depth = 6,                   # tree depth
@@ -141,15 +152,16 @@ params <- list(
   seed = 77                        # reproducibility
 )
 
-
+# Train the model 
 stuff_model = xgboost(data = train_df, label = train_y, nrounds = 250, early_stopping_rounds = 20,print_every_n = 10,  eval_metric = "rmse", booster = "gbtree", params)
 
 
-
+# Check the importance of the features to the model
 features = c('release_speed', 'ivb', 'hb', 'velo_diff', 'ivb_diff', 'release_extension', 'release_pos_z', 'release_pos_x' ,'release_spin_rate', 'spin_axis', 'hand_matchup')
 imp <- xgb.importance(model = stuff_model, feature_names = features)
 imp
 
+# Save for future use
 xgb.save(stuff_model, 'general_stuff_modelv6.model')
 stuff_model = xgb.load('general_stuff_modelv6.model')
 ```
@@ -157,6 +169,7 @@ stuff_model = xgb.load('general_stuff_modelv6.model')
 Step 6: Test on New Data
 
 ```{r}
+# Use the model to grade more test set
 test_set = test_set |> data_prep() |> map_outcomes() |> filter_pitches() |> select(release_speed, ivb, hb, velo_diff, ivb_diff, release_extension, release_pos_z, release_pos_x ,release_spin_rate, spin_axis, hand_matchup , mean_RV)
                                                                                   
 test_df  = test_set |> select(-(mean_RV)) |> as.matrix()
@@ -170,6 +183,7 @@ rmse
 Step 7a: Get RV range for grading
 
 ```{r}
+# Save the run values for future pitch grading. 
 stuff_model = xgb.load("general_stuff_modelv6.model")
 training_data = read_csv_arrow("~/training_data2.csv")
 data_2021 = training_data[training_data$game_date < "2021-09-30" & training_data$game_date> "2021-03-30", ]
@@ -205,8 +219,10 @@ stuff_grading = function(df, model_path="general_stuff_modelv6.model", year = 20
   grading_data = df |> select(-c(player_name, pitch_type, mean_RV, hand_matchup)) |> as.matrix()
   load_model = xgb.load(model_path)
   print(names(df))
+  # Use predictions to grade the new pitches 
   predictions = predict(load_model, grading_data)
   stuff_score = -predictions
+  # Scale the data so an average pitch is 100 and one SD is 20 points of stuff+ 
   stuff_plus = 100 + 20 * ((stuff_score - rv_mean)/rv_sd)
   df = df |> mutate(stuff_plus = stuff_plus, pred_rv = -stuff_score)
   return(df)
@@ -216,6 +232,7 @@ stuff_grading = function(df, model_path="general_stuff_modelv6.model", year = 20
 Step 8: Grade pitchers
 
 ```{r}
+# Grade pitchers by their pitches stuff grades and total stuff grade
 stuff_df = function(df, min_pitches = 50){
   per_pitch = df |> group_by(player_name, pitch_type) |> summarise(avg_stuff_plus =
   mean(stuff_plus), pitch_count = n(), .groups = 'drop') |> filter(pitch_count >= min_pitches)
@@ -233,6 +250,8 @@ stuff_df = function(df, min_pitches = 50){
 Step 9: Grade New Data
 
 ```{r}
+# Grade past data 
+
 training_data = read_csv_arrow("~/training_data2.csv")
 data_2021 = training_data[training_data$game_date < "2021-09-30" & training_data$game_date> "2021-03-30", ]
 data_2022 = training_data[training_data$game_date < "2022-09-30" & training_data$game_date> "2022-03-30", ]
@@ -247,6 +266,8 @@ data_2023 = data_2023 |> stuff_grading(year = 2023) |> stuff_df()
 Step 10: Analyze Results
 
 ```{r}
+# Compare stuff+ against pitching stats
+
 sheet_names <- readxl::excel_sheets("~/Downloads/STUFF PLUS V2.xlsx")
 era24 <- readxl::read_excel("~/Downloads/STUFF PLUS V2.xlsx", sheet = sheet_names[9]) |> filter((IP > 40)) |> 
   mutate(player_name = str_replace(Player, "^(\\S+)\\s+(.*)$", "\\2, \\1")) |> distinct(player_name, .keep_all = TRUE) |> select(player_name, `FIP`, `2024 ERA`)
@@ -282,6 +303,8 @@ ggplot(stuffStats, aes(y = stuff_plus, x = ERA))+
 Step 11: Apply to Coors Data
 
 ```{r}
+# Now that the stuff+ proccess has some validity for predicting future outcomes repeat with just coors field data only 
+
 coors_data = data.frame()
 for (i in 1:4){
   temp = read_csv_arrow(paste0("~/Downloads/coors202",i,'.csv'))
